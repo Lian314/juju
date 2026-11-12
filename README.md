@@ -1,6 +1,7 @@
 # 聚聚 (JuJu TV) —— 坚果 N1 Air 第四代 (Android 13 · 2GB RAM) 专享极速版
 
-> 完整的系统架构设计与核心算法白皮书请参阅：[DOCS_TECHNICAL_ARCHITECTURE.md](file:///D:/ccode/duanjuapp/juju/DOCS_TECHNICAL_ARCHITECTURE.md)
+> 📖 **普通用户上手指南**：请直接阅读 [USER_GUIDE.md](file:///D:/ccode/duanjuapp/juju/USER_GUIDE.md)（含安装教程、遥控器全按键图解、手机扫码遥控与自救换源）。  
+> 🔬 **开发者架构白皮书**：底层技术设计与核心算法请参阅 [DOCS_TECHNICAL_ARCHITECTURE.md](file:///D:/ccode/duanjuapp/juju/DOCS_TECHNICAL_ARCHITECTURE.md)。
 
 ## 一、 核心设计亮点
 1. **专为 2GB 内存 Android 13 投影/电视打造的极简架构**：
