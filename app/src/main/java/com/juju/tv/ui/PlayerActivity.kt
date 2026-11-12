@@ -6,6 +6,7 @@ import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.SurfaceView
@@ -54,6 +55,29 @@ class PlayerActivity : AppCompatActivity() {
     private lateinit var playerManager: JuJuPlayerManager
     private var currentDetail: DramaDetail? = null
     private var currentEpisodeIndex: Int = 1
+
+    // 左右方向键长按 1 秒刻度平滑快进/快退机制
+    private var isLongPressSeeking = false
+    private var longPressKeyCode = 0
+    private var virtualSeekPosMs = -1L
+    private var wasPausedBeforeSeek = false
+    private var longPressStartTime = 0L
+    private var lastThrottledSeekTime = 0L
+
+    private val startLongPressRunnable = Runnable {
+        if (longPressKeyCode != 0) {
+            startLongPressSeeking(longPressKeyCode)
+        }
+    }
+
+    private val longPressTickRunnable = object : Runnable {
+        override fun run() {
+            if (isLongPressSeeking && longPressKeyCode != 0) {
+                executeLongPressTick(longPressKeyCode)
+                scheduleNextLongPressTick()
+            }
+        }
+    }
 
     private val progressLoop = object : Runnable {
         override fun run() {
@@ -129,6 +153,12 @@ class PlayerActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        if (isLongPressSeeking) {
+            finishLongPressSeeking()
+        } else {
+            mainHandler.removeCallbacks(startLongPressRunnable)
+            mainHandler.removeCallbacks(longPressTickRunnable)
+        }
         mainHandler.removeCallbacks(progressLoop)
         updateHudAndSaveHistory()
     }
@@ -198,7 +228,7 @@ class PlayerActivity : AppCompatActivity() {
             setPadding(0, 6, 0, 6)
         }
         hudHintView = TextView(this).apply {
-            text = "左右键：快退/快进10秒  ·  上下键：上一集/下一集  ·  确认键：暂停/播放  ·  菜单键：倍速/解码/弹幕设置"
+            text = "左右键：短按10秒 / 长按1秒精准连续微调  ·  上下键：上一集/下一集  ·  确认键：暂停/播放  ·  菜单键：设置"
             textSize = 12f
             setTextColor(Color.parseColor("#94A3B8"))
         }
@@ -311,20 +341,31 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ||
+            keyCode == KeyEvent.KEYCODE_MEDIA_REWIND || keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD
+        ) {
+            if (event?.repeatCount == 0) {
+                longPressKeyCode = keyCode
+                isLongPressSeeking = false
+                longPressStartTime = SystemClock.uptimeMillis()
+                mainHandler.removeCallbacks(startLongPressRunnable)
+                // 240ms 未松开则视为长按，激活 1 秒刻度平滑连续微调
+                mainHandler.postDelayed(startLongPressRunnable, 240L)
+                return true
+            } else if (event != null && event.repeatCount > 0) {
+                // 系统连续连按事件，立即激活长按
+                if (!isLongPressSeeking && longPressKeyCode == keyCode) {
+                    mainHandler.removeCallbacks(startLongPressRunnable)
+                    startLongPressSeeking(keyCode)
+                }
+                return true
+            }
+        }
+
         when (keyCode) {
             KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
                 playerManager.togglePlayPause()
                 danmakuView.setPlaybackPaused(playerManager.snapshotState().isPaused)
-                showHudTemporarily()
-                return true
-            }
-            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_MEDIA_REWIND -> {
-                playerManager.seekRelative(-10_000L)
-                showHudTemporarily()
-                return true
-            }
-            KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
-                playerManager.seekRelative(10_000L)
                 showHudTemporarily()
                 return true
             }
@@ -342,6 +383,113 @@ class PlayerActivity : AppCompatActivity() {
             }
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ||
+            keyCode == KeyEvent.KEYCODE_MEDIA_REWIND || keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD
+        ) {
+            mainHandler.removeCallbacks(startLongPressRunnable)
+            mainHandler.removeCallbacks(longPressTickRunnable)
+
+            if (isLongPressSeeking) {
+                finishLongPressSeeking()
+                return true
+            } else if (longPressKeyCode == keyCode) {
+                // 短按：单次快进/快退 10 秒
+                longPressKeyCode = 0
+                val delta = if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_MEDIA_REWIND) -10_000L else 10_000L
+                playerManager.seekRelative(delta)
+                showHudTemporarily()
+                return true
+            }
+        }
+        return super.onKeyUp(keyCode, event)
+    }
+
+    private fun startLongPressSeeking(keyCode: Int) {
+        if (isLongPressSeeking) return
+        isLongPressSeeking = true
+        val snap = playerManager.snapshotState()
+        wasPausedBeforeSeek = snap.isPaused
+        if (!wasPausedBeforeSeek) {
+            playerManager.togglePlayPause() // 拖动期间先暂停音频与画面渲染，避免破音与解码卡顿
+            danmakuView.setPlaybackPaused(true)
+        }
+        virtualSeekPosMs = snap.positionMs
+        longPressStartTime = SystemClock.uptimeMillis()
+        lastThrottledSeekTime = SystemClock.uptimeMillis()
+
+        executeLongPressTick(keyCode)
+        scheduleNextLongPressTick()
+    }
+
+    private fun scheduleNextLongPressTick() {
+        mainHandler.removeCallbacks(longPressTickRunnable)
+        if (!isLongPressSeeking) return
+        val heldMs = SystemClock.uptimeMillis() - longPressStartTime
+        // 速率把控：
+        // 前 1.2 秒：每 75ms 步进 1 秒（约 13.3 秒/秒），让用户眼睛清晰跟上每一秒刻度跳动
+        // 超过 1.2 秒：平滑过渡到 50ms 步进 1 秒（约 20 秒/秒），避免长距离拖动等待过久
+        val interval = if (heldMs > 1200L) 50L else 75L
+        mainHandler.postDelayed(longPressTickRunnable, interval)
+    }
+
+    private fun executeLongPressTick(keyCode: Int) {
+        val snap = playerManager.snapshotState()
+        val dur = snap.durationMs.coerceAtLeast(1L)
+        val isForward = (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT || keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD)
+        val delta = if (isForward) 1_000L else -1_000L
+
+        virtualSeekPosMs = (virtualSeekPosMs + delta).coerceIn(0L, dur)
+
+        // 实时更新 HUD，毫秒级显示 1 秒步进刻度
+        updateHudForSeeking(virtualSeekPosMs, dur, isForward)
+
+        // 适度节流（每 250ms）刷新一次底层播放器画面，既能看到背景画面关键帧，又保护 2GB 内存不被连续 Range 请求打爆
+        val now = SystemClock.uptimeMillis()
+        if (now - lastThrottledSeekTime >= 250L) {
+            lastThrottledSeekTime = now
+            playerManager.seekTo(virtualSeekPosMs)
+        }
+    }
+
+    private fun finishLongPressSeeking() {
+        if (!isLongPressSeeking) return
+        isLongPressSeeking = false
+        longPressKeyCode = 0
+        mainHandler.removeCallbacks(startLongPressRunnable)
+        mainHandler.removeCallbacks(longPressTickRunnable)
+
+        val target = virtualSeekPosMs
+        if (target >= 0L) {
+            playerManager.seekTo(target)
+        }
+        if (!wasPausedBeforeSeek) {
+            playerManager.togglePlayPause() // 释放按键后恢复播放
+            danmakuView.setPlaybackPaused(false)
+        }
+        showHudTemporarily()
+        updateHudAndSaveHistory()
+        virtualSeekPosMs = -1L
+    }
+
+    private fun updateHudForSeeking(posMs: Long, durMs: Long, isForward: Boolean) {
+        hudOverlay.visibility = View.VISIBLE
+        mainHandler.removeCallbacks(hideHudRunnable)
+
+        val posSec = posMs / 1000L
+        val durSec = durMs / 1000L
+        val pct = ((posMs * 100L) / durMs.coerceAtLeast(1L)).toInt().coerceIn(0, 100)
+        val icon = if (isForward) "⏩ 连续快进 [1秒刻度]" else "⏪ 连续快退 [1秒刻度]"
+
+        hudProgressView.text = String.format(
+            "%s  %02d:%02d / %02d:%02d (%d%%)  ·  松开按键立即起播",
+            icon,
+            posSec / 60, posSec % 60,
+            durSec / 60, durSec % 60,
+            pct
+        )
     }
 
     private fun showPlayerSettingsDialog() {
