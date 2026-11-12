@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.JuJuTV" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@color/juju_bg_primary</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:colorPrimary">@color/juju_accent</item>
+        <item name="android:colorAccent">@color/juju_accent</item>
+    </style>
+</resources>

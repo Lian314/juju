@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">聚聚</string>
+    <string name="app_subtitle">坚果 N1 Air 2GB 专享极速版 · 零后端去中心化短剧聚合</string>
+    <string name="tv_hint_footer">方向键选择  ·  OK 查看详情/播放  ·  菜单键扫码遥控  ·  返回键逐级退出</string>
+</resources>

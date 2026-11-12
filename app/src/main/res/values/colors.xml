@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="juju_bg_primary">#0B0E14</color>
+    <color name="juju_bg_HashCard">#151A24</color>
+    <color name="juju_bg_elevated">#1E2534</color>
+    <color name="juju_accent">#FF6B35</color>
+    <color name="juju_accent_glow">#38BDF8</color>
+    <color name="juju_text_primary">#F8FAFC</color>
+    <color name="juju_text_secondary">#94A3B8</color>
+    <color name="juju_text_muted">#64748B</color>
+    <color name="juju_badge_bg">#CC1E293B</color>
+    <color name="juju_success">#22C55E</color>
+    <color name="juju_warning">#F59E0B</color>
+    <color name="juju_danger">#EF4444</color>
+</resources>

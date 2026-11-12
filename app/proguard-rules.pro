@@ -1,0 +1,2 @@
+-keep class com.juju.tv.model.** { *; }
+-dontwarn org.bouncycastle.**

@@ -1,0 +1,68 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.juju.tv'
+    compileSdk 34
+    buildToolsVersion "30.0.3"
+
+    defaultConfig {
+        applicationId "com.juju.tv"
+        minSdk 26
+        targetSdk 33
+        versionCode 100
+        versionName "1.0.0-n1air"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    kotlinOptions {
+        jvmTarget = '11'
+    }
+
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.appcompat:appcompat:1.3.1'
+    implementation 'androidx.recyclerview:recyclerview:1.3.2'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.6.2'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.4'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+
+    // 硬件直出播放器内核 (ExoPlayer Core + HLS + UI)
+    implementation 'com.google.android.exoplayer:exoplayer-core:2.11.7'
+    implementation 'com.google.android.exoplayer:exoplayer-hls:2.11.7'
+    implementation 'com.google.android.exoplayer:exoplayer-ui:2.11.7'
+
+    // 高性能网络、JSON 序列化、内置 HTTP 网关与国密 SM3 / 加密支持
+    implementation 'com.squareup.okhttp3:okhttp:3.14.9'
+    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'org.nanohttpd:nanohttpd:2.3.1'
+    implementation 'org.bouncycastle:bcprov-jdk15on:1.70'
+
+    // 单元测试
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20180813'
+}
