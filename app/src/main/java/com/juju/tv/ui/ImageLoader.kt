@@ -4,17 +4,22 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ImageDecoder
 import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Shader
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.util.LruCache
 import android.widget.ImageView
 import com.juju.tv.memory.MemoryGovernor
 import com.juju.tv.model.MemoryWatermark
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.net.URI
+import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -25,18 +30,24 @@ import java.util.concurrent.TimeUnit
  * 1. 强制采用 `Bitmap.Config.RGB_565`（每像素 2 字节，相比默认 ARGB_8888 节省 50% 内存）；
  * 2. 自动按 TV 卡片实际物理尺寸 (`240 × 336 px`) 计算 `inSampleSize` 降维解码，单张海报仅占 ~160KB；
  * 3. 与 [MemoryGovernor] 实时联动：当系统进入 MODERATE / LOW / CRITICAL 水位时动态调用 `resize()` 或 `evictAll()`；
- * 4. 固定 3 线程轻量解码池，防止滑动海报墙时并发创建大量线程。
+ * 4. 固定 3 线程轻量解码池，按目标域名注入 Chrome UA + Referer，兼容 Android 9+ `ImageDecoder`（WebP/HEIF）；
+ * 5. 失败时仅展示占位图而不污染 URL 缓存，保证网络恢复或列表复用时可再次重试加载真实封面。
  */
 class ImageLoader(
     memoryGovernor: MemoryGovernor,
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(6, TimeUnit.SECONDS)
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
         .build()
 ) {
     companion object {
+        private const val TAG = "JuJuImageLoader"
         const val TARGET_POSTER_WIDTH = 240
         const val TARGET_POSTER_HEIGHT = 336
+        private const val BROWSER_UA =
+            "Mozilla/5.0 (Linux; Android 13; JMGO N1 Air) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
         /**
          * 计算最佳 2 的幂次降采样倍率 `inSampleSize`
@@ -80,7 +91,8 @@ class ImageLoader(
     }
 
     fun loadPoster(imageView: ImageView, url: String, titleFallback: String, categoryBadge: String = "") {
-        val cacheKey = url.ifBlank { "fallback:$categoryBadge:${titleFallback.take(14)}" }
+        val cleanUrl = if (url.startsWith("//")) "https:$url" else url.trim()
+        val cacheKey = cleanUrl.ifBlank { "fallback:$categoryBadge:${titleFallback.take(14)}" }
         imageView.tag = cacheKey
 
         val cached = synchronized(memoryCache) { memoryCache.get(cacheKey) }
@@ -89,7 +101,6 @@ class ImageLoader(
             return
         }
 
-        // 复用或生成深色渐变占位图，避免在主线程重复分配 Bitmap
         val placeholderKey = "fallback:$categoryBadge:${titleFallback.take(14)}"
         val placeholder = synchronized(memoryCache) {
             memoryCache.get(placeholderKey)?.takeIf { !it.isRecycled }
@@ -98,31 +109,68 @@ class ImageLoader(
         }
         imageView.setImageBitmap(placeholder)
 
-        if (url.isBlank() || url.startsWith("local://")) {
+        if (cleanUrl.isBlank() || cleanUrl.startsWith("local://")) {
             return
         }
 
         executor.execute {
-            val bmp = fetchAndDecodeRgb565(url) ?: placeholder
-            synchronized(memoryCache) {
-                memoryCache.put(cacheKey, bmp)
-            }
-            mainHandler.post {
-                if (imageView.tag == cacheKey) {
-                    imageView.setImageBitmap(bmp)
+            val realBmp = fetchWithRetry(cleanUrl)
+            if (realBmp != null) {
+                synchronized(memoryCache) {
+                    memoryCache.put(cacheKey, realBmp)
+                }
+                mainHandler.post {
+                    if (imageView.tag == cacheKey) {
+                        imageView.setImageBitmap(realBmp)
+                    }
                 }
             }
         }
     }
 
+    private fun fetchWithRetry(url: String): Bitmap? {
+        return fetchAndDecodeRgb565(url) ?: run {
+            try {
+                Thread.sleep(150L)
+            } catch (_: InterruptedException) {
+            }
+            fetchAndDecodeRgb565(url)
+        }
+    }
+
+    private fun resolveReferer(url: String): String {
+        val lower = url.lowercase()
+        if (lower.contains("byteimg.com") || lower.contains("fqnovelpic.com") || lower.contains("hongguoduanju.com")) {
+            return "https://hongguoduanju.com/"
+        }
+        return try {
+            val uri = URI(url)
+            if (!uri.scheme.isNullOrBlank() && !uri.host.isNullOrBlank()) {
+                "${uri.scheme}://${uri.host}/"
+            } else {
+                ""
+            }
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
     private fun fetchAndDecodeRgb565(url: String): Bitmap? {
         return try {
-            val req = Request.Builder()
+            val reqBuilder = Request.Builder()
                 .url(url)
-                .header("User-Agent", "JuJuTV/1.0 (Android 13; JMGO N1 Air)")
-                .build()
-            val bytes = httpClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return null
+                .header("User-Agent", BROWSER_UA)
+                .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+            val referer = resolveReferer(url)
+            if (referer.isNotBlank()) {
+                reqBuilder.header("Referer", referer)
+            }
+
+            val bytes = httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    Log.w(TAG, "Poster HTTP ${resp.code()} for $url")
+                    return null
+                }
                 resp.body()?.bytes()
             } ?: return null
             if (bytes.isEmpty()) return null
@@ -132,24 +180,51 @@ class ImageLoader(
             }
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOpts)
 
-            val decodeOpts = BitmapFactory.Options().apply {
-                inSampleSize = calculateInSampleSize(
-                    boundsOpts.outWidth,
-                    boundsOpts.outHeight,
-                    TARGET_POSTER_WIDTH,
-                    TARGET_POSTER_HEIGHT
-                )
-                inPreferredConfig = Bitmap.Config.RGB_565
-                inMutable = false
+            if (boundsOpts.outWidth > 0 && boundsOpts.outHeight > 0) {
+                val decodeOpts = BitmapFactory.Options().apply {
+                    inSampleSize = calculateInSampleSize(
+                        boundsOpts.outWidth,
+                        boundsOpts.outHeight,
+                        TARGET_POSTER_WIDTH,
+                        TARGET_POSTER_HEIGHT
+                    )
+                    inPreferredConfig = Bitmap.Config.RGB_565
+                    inMutable = false
+                }
+                val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)
+                if (decoded != null) return decoded
             }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)
-        } catch (_: Throwable) {
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val src = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
+                val decoded = ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    decoder.isMutableRequired = false
+                    val w = info.size.width
+                    val h = info.size.height
+                    if (w > 0 && h > 0) {
+                        val ratio = minOf(TARGET_POSTER_WIDTH.toFloat() / w, TARGET_POSTER_HEIGHT.toFloat() / h, 1f)
+                        val tw = (w * ratio).toInt().coerceAtLeast(1)
+                        val th = (h * ratio).toInt().coerceAtLeast(1)
+                        decoder.setTargetSize(tw, th)
+                    }
+                }
+                if (decoded.config != Bitmap.Config.RGB_565 && decoded.config != Bitmap.Config.HARDWARE) {
+                    val rgb565 = decoded.copy(Bitmap.Config.RGB_565, false)
+                    decoded.recycle()
+                    return rgb565
+                }
+                return decoded
+            }
+            null
+        } catch (t: Throwable) {
+            Log.w(TAG, "Poster decode failed for $url: ${t.message}")
             null
         }
     }
 
     /**
-     * 生成高质感 RGB_565 渐变电影海报（仅占 150KB，保证弱网/内网环境下大屏依然美观）
+     * 生成高质感 RGB_565 渐变占位海报（仅占 150KB）
      */
     private fun renderStylizedPosterBitmap(title: String, category: String): Bitmap {
         val w = TARGET_POSTER_WIDTH
@@ -171,14 +246,12 @@ class ImageLoader(
         }
         canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), bgPaint)
 
-        // 装饰光环
         val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = palette[2]
             alpha = 45
         }
         canvas.drawCircle(w * 0.78f, h * 0.24f, 68f, glowPaint)
 
-        // 分类角标
         if (category.isNotBlank()) {
             val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = palette[2]
@@ -192,7 +265,6 @@ class ImageLoader(
             canvas.drawText(category.take(4), 26f, 36f, badgeTextPaint)
         }
 
-        // 绘制剧名（自动分行）
         val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
             textSize = 22f
@@ -209,7 +281,7 @@ class ImageLoader(
             color = 0xFF94A3B8.toInt()
             textSize = 14f
         }
-        canvas.drawText("聚聚 · 1080P 直出", 18f, h - 16f, subPaint)
+        canvas.drawText("正在加载封面...", 18f, h - 16f, subPaint)
         return bmp
     }
 }

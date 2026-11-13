@@ -185,8 +185,9 @@ textarea.input-box, input.input-box {
       <p style="font-size:12px;color:var(--muted);margin-bottom:8px;">
         当第三方站源域名变更或停服时，可在此直接填入自定义 JSON、苹果 MacCMS V10 接口或 M3U8 列表地址，电视立即热挂载生效！
       </p>
-      <input id="src-name" class="input-box" placeholder="站源名称（如：私人NAS剧库 / 备用源）">
-      <input id="src-url" class="input-box" placeholder="接口地址 https://.../api.json 或 .m3u8">
+      <input id="src-name" class="input-box" placeholder="站源名称（如：私人NAS剧库 / MacCMS 源）">
+      <input id="src-url" class="input-box" placeholder="接口地址 https://.../api.php/provide/vod/ 或 .m3u8">
+      <textarea id="src-raw" class="input-box" rows="3" placeholder="可选：直接粘贴 JSON / M3U 列表全文（留空则从上方 URL 拉取）"></textarea>
       <button class="btn" onclick="addCustomSource()">保存到电视并立即挂载</button>
       <div id="custom-src-list" style="margin-top:12px;font-size:12px;"></div>
     </div>
@@ -205,7 +206,7 @@ textarea.input-box, input.input-box {
         <button class="btn btn-ghost" onclick="copyDiagnostics()">一键复制诊断信息</button>
         <button class="btn btn-ghost" onclick="switchDecoder('auto')">切至：零拷贝直出</button>
         <button class="btn btn-ghost" onclick="switchDecoder('compatible')">切至：兼容模式</button>
-        <button class="btn btn-ghost" onclick="resetHongguoDevice()">重置红果设备身份</button>
+        <button class="btn btn-ghost" onclick="resetHongguoDevice()">刷新片库并重置熔断</button>
       </div>
     </div>
   </section>
@@ -486,13 +487,17 @@ function saveDomainOverride() {
 function addCustomSource() {
   const name = document.getElementById('src-name').value.trim();
   const url = document.getElementById('src-url').value.trim();
-  if (!name || !url) { alert('请填写站源名称与 URL'); return; }
+  const rawEl = document.getElementById('src-raw');
+  const raw = rawEl ? rawEl.value.trim() : '';
+  if (!name || (!url && !raw)) { alert('请填写站源名称与 URL（或直接粘贴 JSON/M3U 内容）'); return; }
+  const useM3u = raw.startsWith('#EXTM3U') || url.endsWith('.m3u8') || url.endsWith('.m3u');
   fetch('/api/sources', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ name: name, url: url, type: url.endsWith('.m3u8') || url.endsWith('.m3u') ? 'm3u' : 'json' })
+    body: JSON.stringify({ name: name, url: url || ('local://' + Date.now()), type: useM3u ? 'm3u' : 'json', rawContent: raw })
   }).then(r => r.json()).then(d => {
     alert(d.message || '已挂载到电视！');
+    if (rawEl) rawEl.value = '';
     initSourcesAndDiag();
   });
 }

@@ -13,6 +13,7 @@ import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -24,6 +25,7 @@ import com.juju.tv.model.DramaDetail
 import com.juju.tv.model.WatchHistoryEntry
 import com.juju.tv.player.JuJuPlayerManager
 import com.juju.tv.player.LiteDanmakuView
+import com.juju.tv.remote.NsdHelper
 import java.util.concurrent.Executors
 
 /**
@@ -51,6 +53,11 @@ class PlayerActivity : AppCompatActivity() {
     private lateinit var hudTitleView: TextView
     private lateinit var hudProgressView: TextView
     private lateinit var hudHintView: TextView
+    private lateinit var errorOverlay: LinearLayout
+    private lateinit var errorTitleView: TextView
+    private lateinit var errorMsgView: TextView
+    private lateinit var errorRetryBtn: Button
+    private lateinit var errorBackBtn: Button
 
     private lateinit var playerManager: JuJuPlayerManager
     private var currentDetail: DramaDetail? = null
@@ -111,7 +118,9 @@ class PlayerActivity : AppCompatActivity() {
             }
         }
         playerManager.onPlayerError = { msg ->
-            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            mainHandler.post {
+                showErrorOverlay("⚠️ 视频播放失败", msg)
+            }
         }
 
         // 绑定手机扫码遥控实时控制与设置热更新回调
@@ -140,7 +149,7 @@ class PlayerActivity : AppCompatActivity() {
             }
         }
 
-        val dramaId = intent.getStringExtra("drama_id") ?: "hg_1001"
+        val dramaId = intent.getStringExtra("drama_id") ?: ""
         val epIndex = intent.getIntExtra("episode_index", 1)
         val startPos = intent.getLongExtra("start_position_ms", 0L)
         loadDramaAndPlay(dramaId, epIndex, startPos)
@@ -238,12 +247,102 @@ class PlayerActivity : AppCompatActivity() {
         hudOverlay.addView(hudHintView)
         root.addView(hudOverlay)
 
+        // 4. 播放失败/无直链时的可视化引导遮罩（彻底告别黑屏只飘弹幕）
+        errorOverlay = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.parseColor("#E60B0E14"))
+            setPadding(72, 48, 72, 48)
+            visibility = View.GONE
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        }
+        errorTitleView = TextView(this).apply {
+            textSize = 24f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(Color.parseColor("#FF6B35"))
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 16)
+        }
+        errorMsgView = TextView(this).apply {
+            textSize = 15f
+            setTextColor(Color.parseColor("#E2E8F0"))
+            gravity = Gravity.CENTER
+            setLineSpacing(6f, 1.15f)
+            setPadding(0, 0, 0, 28)
+        }
+        val errorBtnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        errorRetryBtn = Button(this).apply {
+            text = "🔄 切换解码 / 重试"
+            textSize = 14f
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#1E2534"))
+            setPadding(28, 12, 28, 12)
+            setOnFocusChangeListener { v, hasFocus ->
+                v.setBackgroundColor(if (hasFocus) Color.parseColor("#FF6B35") else Color.parseColor("#1E2534"))
+            }
+            setOnClickListener {
+                showPlayerSettingsDialog()
+            }
+        }
+        errorBackBtn = Button(this).apply {
+            text = "⬅ 返回上一页"
+            textSize = 14f
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#FF6B35"))
+            setPadding(32, 12, 32, 12)
+            val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            lp.leftMargin = 20
+            layoutParams = lp
+            setOnFocusChangeListener { v, hasFocus ->
+                v.setBackgroundColor(if (hasFocus) Color.parseColor("#FF6B35") else Color.parseColor("#1E2534"))
+            }
+            setOnClickListener { finish() }
+        }
+        errorBtnRow.addView(errorRetryBtn)
+        errorBtnRow.addView(errorBackBtn)
+        errorOverlay.addView(errorTitleView)
+        errorOverlay.addView(errorMsgView)
+        errorOverlay.addView(errorBtnRow)
+        root.addView(errorOverlay)
+
         setContentView(root)
     }
 
+    private fun showErrorOverlay(title: String, message: String) {
+        hudOverlay.visibility = View.GONE
+        danmakuView.setPlaybackPaused(true)
+        danmakuView.setDanmakuList(emptyList())
+        errorTitleView.text = title
+        errorMsgView.text = message
+        errorOverlay.visibility = View.VISIBLE
+        errorBackBtn.post { errorBackBtn.requestFocus() }
+    }
+
+    private fun hideErrorOverlay() {
+        errorOverlay.visibility = View.GONE
+    }
+
     private fun loadDramaAndPlay(dramaId: String, episodeIndex: Int, startPositionMs: Long) {
+        if (dramaId.isBlank()) {
+            showErrorOverlay("⚠️ 缺少剧集编号", "未传入有效剧集 ID，请返回首页重新选择剧集。")
+            return
+        }
         bgExecutor.execute {
-            val detail = app.providerRegistry.fetchDetail(dramaId) ?: return@execute
+            val detail = app.providerRegistry.fetchDetail(dramaId)
+            if (detail == null) {
+                mainHandler.post {
+                    showErrorOverlay("⚠️ 获取剧集详情失败", "未找到该剧集详情或当前网络连接异常，请检查 Wi-Fi 或在「手机遥控 → 自救源/诊断」添加自有片源。")
+                }
+                return@execute
+            }
             currentDetail = detail
             playEpisodeInternal(detail, episodeIndex, startPositionMs)
         }
@@ -252,8 +351,28 @@ class PlayerActivity : AppCompatActivity() {
     private fun playEpisodeInternal(detail: DramaDetail, episodeIndex: Int, startPositionMs: Long) {
         val targetEp = detail.episodes.firstOrNull { it.index == episodeIndex }
             ?: detail.episodes.firstOrNull()
-            ?: return
+        if (targetEp == null) {
+            mainHandler.post {
+                showErrorOverlay("⚠️ 暂无分集列表", "《${detail.title}》暂无分集信息，请返回并配置其他片源。")
+            }
+            return
+        }
         currentEpisodeIndex = targetEp.index
+
+        if (targetEp.streamUrl.isBlank()) {
+            val lanIp = NsdHelper.detectLanIpv4()
+            val port = app.lanRemoteServer.listeningPort
+            mainHandler.post {
+                showErrorOverlay(
+                    "📺 暂未匹配到可播直链",
+                    "《${detail.title}》第 ${targetEp.index} 集当前来自公开网页目录（官网已标记受播放保护，无免授权直连流）。\n\n" +
+                        "解决方式：\n" +
+                        "1. 同一 Wi-Fi 下手机浏览器打开 http://$lanIp:$port →「自救/设置」添加您自己的 MacCMS V10 / M3U8 / NAS 片源；\n" +
+                        "2. 若自建片源中含有同名剧集，聚聚会自动匹配直链并起播；也可直接在主界面进入您的自定义片源播放。"
+                )
+            }
+            return
+        }
 
         // 维护滑动窗口：只保留当前集和下一集的本地预加载文件，立即清理更早的分集缓存
         app.preloadManager.keepWindow(detail.id, currentEpisodeIndex, windowSize = 2)
@@ -263,6 +382,7 @@ class PlayerActivity : AppCompatActivity() {
         val settings = app.repository.getSettings()
 
         mainHandler.post {
+            hideErrorOverlay()
             hudTitleView.text = "《${detail.title}》 · 第 ${targetEp.index}/${detail.totalEpisodes} 集" +
                     (if (resolved.preloadedFilePath != null) " ⚡ [已命中本地预加载]" else "")
             showHudTemporarily()

@@ -44,7 +44,7 @@ class DetailActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setupLayout()
-        val dramaId = intent.getStringExtra("drama_id") ?: "hg_1001"
+        val dramaId = intent.getStringExtra("drama_id") ?: ""
         loadDetail(dramaId)
     }
 
@@ -162,6 +162,12 @@ class DetailActivity : AppCompatActivity() {
     }
 
     private fun loadDetail(dramaId: String) {
+        if (dramaId.isBlank()) {
+            titleView.text = "未指定剧集"
+            introView.text = "请返回主界面重新选择剧集。"
+            return
+        }
+        titleView.text = "正在加载剧集详情..."
         bgExecutor.execute {
             val detail = app.providerRegistry.fetchDetail(dramaId)
             mainHandler.post {
@@ -169,6 +175,9 @@ class DetailActivity : AppCompatActivity() {
                     currentDetail = detail
                     bindDetail(detail)
                 } else {
+                    titleView.text = "加载剧集详情失败"
+                    metaView.text = "请检查网络连接或返回主界面切换站源"
+                    introView.text = "未获取到该剧详情；如果您在使用自建站源，请确保数据源链接有效且包含该剧目。"
                     Toast.makeText(this, "加载剧集详情失败", Toast.LENGTH_SHORT).show()
                 }
             }
@@ -176,8 +185,11 @@ class DetailActivity : AppCompatActivity() {
     }
 
     private fun bindDetail(detail: DramaDetail) {
+        val hasPlayable = detail.episodes.any { it.streamUrl.isNotBlank() }
         titleView.text = detail.title
-        metaView.text = "${detail.sourceName}  ·  ${detail.category}  ·  评分 ${detail.score}  ·  共 ${detail.totalEpisodes} 集  ·  ${detail.tags.joinToString(" / ")}"
+        metaView.text = "${detail.sourceName}  ·  ${detail.category}  ·  评分 ${detail.score}  ·  共 ${detail.totalEpisodes} 集  ·  " +
+            (if (hasPlayable) "✅ 直链可播" else "ℹ️ 公开目录（播放需匹配自建源）") +
+            "  ·  ${detail.tags.joinToString(" / ")}"
         introView.text = detail.intro
         app.imageLoader.loadPoster(coverView, detail.coverUrl, detail.title, detail.category)
 

@@ -102,7 +102,15 @@ class JuJuPlayerManager(
             }
 
             override fun onPlayerError(error: ExoPlaybackException) {
-                onPlayerError?.invoke(error.message ?: "解码器播放异常，可在设置中切换「兼容」解码档位")
+                val detailMsg = when (error.type) {
+                    ExoPlaybackException.TYPE_SOURCE ->
+                        "视频源加载失败（地址不可达或防盗链拦截）：${error.sourceException.message ?: "网络/源异常"}"
+                    ExoPlaybackException.TYPE_RENDERER ->
+                        "解码器异常（可在下方或菜单键切换「兼容/软解」档位）：${error.rendererException.message ?: "解码失败"}"
+                    else ->
+                        error.message ?: "播放异常，请检查网络或切换解码档位"
+                }
+                onPlayerError?.invoke(detailMsg)
             }
         })
 
@@ -135,10 +143,15 @@ class JuJuPlayerManager(
         totalEpisodes = totalEps
         preloadTriggeredForCurrentEp = false
 
+        if (stream.localPlaybackUrl.isBlank()) {
+            onPlayerError?.invoke("该集未配置可播直链，请在「手机遥控 → 自救源/诊断」添加 MacCMS / M3U 片源")
+            return
+        }
+
         val dataSourceFactory = DefaultHttpDataSourceFactory(
-            "JuJuTV/1.0 (Android 13; JMGO N1 Air)",
+            "Mozilla/5.0 (Linux; Android 13; JMGO N1 Air) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             8_000,
-            12_000,
+            15_000,
             true
         )
         for ((k, v) in stream.headers) {

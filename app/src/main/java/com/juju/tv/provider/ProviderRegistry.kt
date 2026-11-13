@@ -100,6 +100,11 @@ class ProviderRegistry(
         }
     }
 
+    fun resetHealthAndCaches() {
+        providers.forEach { healthTracker.reset(it.sourceId) }
+        hongguoProvider.clearCache()
+    }
+
     /**
      * 获取首页全部推荐轨道（固定顺序：hot -> category:漫剧 -> category:真人剧 -> category:AI 剧 -> rest）
      */
@@ -211,6 +216,7 @@ class ProviderRegistry(
     }
 
     fun fetchDetail(dramaId: String): DramaDetail? {
+        if (dramaId.isBlank()) return null
         val targetProvider = when {
             dramaId.startsWith("hj_") -> huangjuProvider
             dramaId.startsWith("hd_") -> huangdouProvider
@@ -219,7 +225,19 @@ class ProviderRegistry(
         }
         if (targetProvider != customSourceEngine && healthTracker.isAvailable(targetProvider.sourceId)) {
             val detail = callProviderSafely(targetProvider) { prov, overrideUrl -> prov.fetchDetail(dramaId, overrideUrl) }
-            if (detail != null && detail.episodes.isNotEmpty()) return detail
+            if (detail != null) {
+                if (detail.episodes.none { it.streamUrl.isNotBlank() }) {
+                    val matched = customSourceEngine.findDynamicByTitle(detail.title)
+                    if (matched != null && matched.episodes.any { it.streamUrl.isNotBlank() }) {
+                        return detail.copy(
+                            sourceName = "${detail.sourceName} · 已匹配「${matched.sourceName}」直链",
+                            episodes = matched.episodes,
+                            totalEpisodes = matched.episodes.size
+                        )
+                    }
+                }
+                return detail
+            }
         }
         return customSourceEngine.fetchDetail(dramaId)
     }

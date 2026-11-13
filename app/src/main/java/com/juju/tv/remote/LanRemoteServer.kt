@@ -94,6 +94,9 @@ class LanRemoteServer(
     @Volatile
     var onSettingsChangedCallback: ((JuJuSettings) -> Unit)? = null
 
+    @Volatile
+    var onSourcesChangedCallback: (() -> Unit)? = null
+
     fun startServer(): Int {
         if (!isAlive) {
             try {
@@ -417,6 +420,8 @@ class LanRemoteServer(
                         } else {
                             providerRegistry.customSourceEngine.refreshCustomSource(cfg)
                         }
+                        providerRegistry.resetHealthAndCaches()
+                        onSourcesChangedCallback?.invoke()
                         return corsResponse(
                             jsonOk(
                                 mapOf(
@@ -431,6 +436,8 @@ class LanRemoteServer(
                         if (id.isNotBlank()) {
                             repository.deleteCustomSource(id)
                             providerRegistry.customSourceEngine.removeCustomSource(id)
+                            providerRegistry.resetHealthAndCaches()
+                            onSourcesChangedCallback?.invoke()
                         }
                     }
                     jsonOk(
@@ -452,7 +459,8 @@ class LanRemoteServer(
                 )
                 "/api/hongguo/reset-device" -> {
                     val fresh = HongguoProtocol.resetIdentity()
-                    providerRegistry.healthTracker.reset("hongguo")
+                    providerRegistry.resetHealthAndCaches()
+                    onSourcesChangedCallback?.invoke()
                     jsonOk(mapOf("ok" to true, "deviceId" to fresh.deviceId, "installId" to fresh.installId))
                 }
                 "/api/hongguo/login", "/api/hongguo/logout",
@@ -492,11 +500,17 @@ class LanRemoteServer(
             }
 
             try {
-                val originReferer = try {
-                    val u = URI(trimmed)
-                    "${u.scheme}://${u.host}/"
-                } catch (_: Throwable) {
+                val originReferer = if (trimmed.contains("byteimg.com", ignoreCase = true) ||
+                    trimmed.contains("fqnovelpic.com", ignoreCase = true)
+                ) {
                     "https://hongguoduanju.com/"
+                } else {
+                    try {
+                        val u = URI(trimmed)
+                        "${u.scheme}://${u.host}/"
+                    } catch (_: Throwable) {
+                        "https://hongguoduanju.com/"
+                    }
                 }
                 val req = Request.Builder()
                     .url(trimmed)

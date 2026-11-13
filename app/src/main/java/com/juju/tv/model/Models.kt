@@ -247,8 +247,8 @@ data class JuJuSettings(
     val posterColumns: Int = 6,
     val enabledSources: Map<String, Boolean> = mapOf(
         "hongguo" to true,
-        "huangju" to true,
-        "huangdou" to true,
+        "huangju" to false,
+        "huangdou" to false,
         "custom" to true
     ),
     val sourceDomainOverrides: Map<String, String> = emptyMap()

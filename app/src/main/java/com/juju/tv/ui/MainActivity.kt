@@ -10,6 +10,7 @@ import android.os.Looper
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
@@ -50,6 +51,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var heroDetailBtn: Button
     private lateinit var sectionTitleView: TextView
     private lateinit var posterRecyclerView: RecyclerView
+    private lateinit var emptyStateView: TextView
     private lateinit var posterAdapter: DramaGridAdapter
 
     private var currentHeroCard: DramaCard? = null
@@ -241,18 +243,32 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(sectionTitleView)
 
-        // 5. 6 列硬件加速海报网格
+        // 5. 6 列硬件加速海报网格 + 空态/引导层
         posterAdapter = DramaGridAdapter { card ->
             openDetail(card.id)
+        }
+        val contentFrame = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
         posterRecyclerView = RecyclerView(this).apply {
             layoutManager = GridLayoutManager(this@MainActivity, 6)
             adapter = posterAdapter
             setHasFixedSize(true)
             setItemViewCacheSize(4) // 严格控制离屏 ViewHolder 数量以节省 2GB 内存
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         }
-        root.addView(posterRecyclerView)
+        emptyStateView = TextView(this).apply {
+            textSize = 16f
+            setTextColor(Color.parseColor("#94A3B8"))
+            gravity = Gravity.CENTER
+            setPadding(48, 32, 48, 32)
+            setLineSpacing(6f, 1.2f)
+            visibility = View.GONE
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        contentFrame.addView(posterRecyclerView)
+        contentFrame.addView(emptyStateView)
+        root.addView(contentFrame)
 
         // 6. 底部遥控器操作提示栏
         val footerView = TextView(this).apply {
@@ -282,6 +298,12 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        app.lanRemoteServer.onSourcesChangedCallback = {
+            mainHandler.post {
+                loadChannelFeed("hot", "🔥 热门短剧 · 已刷新最新站源")
+                Toast.makeText(this, "📺 已同步手机端更新的站源片库", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     private fun updateMemoryAndLanBadge() {
@@ -307,18 +329,39 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun renderGridItems(items: List<DramaCard>, emptyMessage: String) {
+        posterAdapter.submitList(items)
+        if (items.isEmpty()) {
+            posterRecyclerView.visibility = View.GONE
+            emptyStateView.text = emptyMessage
+            emptyStateView.visibility = View.VISIBLE
+        } else {
+            emptyStateView.visibility = View.GONE
+            posterRecyclerView.visibility = View.VISIBLE
+        }
+    }
+
     private fun loadChannelFeed(railKey: String, titleText: String) {
         sectionTitleView.text = titleText
+        emptyStateView.visibility = View.GONE
         bgExecutor.execute {
             val rail = app.providerRegistry.fetchSingleRail(railKey)
+            val lanIp = NsdHelper.detectLanIpv4()
+            val port = app.lanRemoteServer.listeningPort
             mainHandler.post {
-                posterAdapter.submitList(rail.items)
-                if (currentHeroCard == null && rail.items.isNotEmpty()) {
+                renderGridItems(
+                    rail.items,
+                    "当前频道暂无内容\n\n请检查网络以加载公开目录，或同一 Wi-Fi 下用手机打开\nhttp://$lanIp:$port →「自救/设置」添加您的 MacCMS V10 / M3U / NAS 片源"
+                )
+                if (rail.items.isNotEmpty() && currentHeroCard == null) {
                     val first = rail.items.first()
                     currentHeroCard = first
                     heroTitleView.text = "今日首推：《${first.title}》 (${first.latestEpisodeText})"
                     heroMetaView.text = "${first.category} · 评分 ${first.score} · ${first.intro.ifBlank { "1080P 硬件直出高清短剧" }}"
                     heroPlayBtn.text = "▶ 立即播放第1集"
+                } else if (rail.items.isEmpty() && currentHeroCard == null) {
+                    heroTitleView.text = "暂未加载到剧集目录"
+                    heroMetaView.text = "请检查网络，或点击「📱 手机遥控」导入您自己的 MacCMS V10 / M3U8 片源"
                 }
             }
         }
@@ -328,7 +371,9 @@ class MainActivity : AppCompatActivity() {
         sectionTitleView.text = "🏆 全网短剧热播总榜"
         bgExecutor.execute {
             val items = app.providerRegistry.fetchRankings("热播榜", 1)
-            mainHandler.post { posterAdapter.submitList(items) }
+            mainHandler.post {
+                renderGridItems(items, "榜单加载失败或暂无数据，请检查网络连接或稍后重试")
+            }
         }
     }
 
@@ -357,7 +402,7 @@ class MainActivity : AppCompatActivity() {
             )
         }
         val combined = (follows + histories).distinctBy { it.id }
-        posterAdapter.submitList(combined)
+        renderGridItems(combined, "暂无追剧收藏或观看记录，浏览任意剧集即可自动同步记录")
     }
 
     private fun showSearchDialog() {
@@ -374,7 +419,9 @@ class MainActivity : AppCompatActivity() {
                     sectionTitleView.text = "🔍 搜索结果：「$kw」"
                     bgExecutor.execute {
                         val results = app.providerRegistry.searchAll(kw, 1)
-                        mainHandler.post { posterAdapter.submitList(results) }
+                        mainHandler.post {
+                            renderGridItems(results, "未搜到与「$kw」相关的剧集，可在「手机遥控」中添加更多自建站源")
+                        }
                     }
                 }
             }
@@ -424,7 +471,7 @@ class MainActivity : AppCompatActivity() {
             "下一集无缝预加载：${if (settings.preloadNextEpisode) "已开启 (仅占1集缓存)" else "已关闭"}",
             "大屏弹幕：${if (settings.danmakuEnabled) "已开启 (低内存自动挂起)" else "已关闭"}",
             "立即清理预加载缓存并释放内存（当前可用 ${snap.systemAvailRamMb}MB）",
-            "重置红果虚拟设备身份（解决偶发取流受限）"
+            "刷新站源状态并重新拉取推荐目录（清除熔断缓存）"
         )
 
         AlertDialog.Builder(this)
@@ -452,8 +499,10 @@ class MainActivity : AppCompatActivity() {
                         Toast.makeText(this, "✅ 已清理预加载磁盘缓存并收缩海报池", Toast.LENGTH_SHORT).show()
                     }
                     4 -> {
-                        val id = com.juju.tv.provider.HongguoProtocol.resetIdentity()
-                        Toast.makeText(this, "✅ 已生成新设备指纹：${id.deviceId}", Toast.LENGTH_SHORT).show()
+                        app.providerRegistry.resetHealthAndCaches()
+                        currentHeroCard = null
+                        loadChannelFeed("hot", "🔥 热门短剧 · 全站实时热播")
+                        Toast.makeText(this, "✅ 已重置站源状态并刷新最新片单", Toast.LENGTH_SHORT).show()
                     }
                 }
             }

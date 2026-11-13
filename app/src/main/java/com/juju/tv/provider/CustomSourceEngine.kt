@@ -4,7 +4,6 @@ import com.google.gson.JsonParser
 import com.juju.tv.model.BrowseQuery
 import com.juju.tv.model.CategoryNode
 import com.juju.tv.model.CommentItem
-import com.juju.tv.model.CreatorInfo
 import com.juju.tv.model.CustomSourceConfig
 import com.juju.tv.model.DanmakuItem
 import com.juju.tv.model.DramaCard
@@ -13,32 +12,35 @@ import com.juju.tv.model.EpisodeItem
 import com.juju.tv.model.RailFeed
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
- * 去中心化自定义站源与高可用内置剧库引擎（「聚聚」防失联自救核心）
+ * 去中心化自定义站源与片源聚合引擎（「聚聚」合规开放站源核心）
  *
- * 解决痛点：“哪天原作者把服务停了我该怎么自己启动？”
  * 1. 支持解析三种通用去中心化源格式（可通过手机扫码实时热添加）：
  *    - 格式 A：聚聚标准 JSON 源 (`{"dramas":[...]}`)
- *    - 格式 B：全网通用的苹果 CMS / MacCMS V10 VOD 接口 (`{"list":[{"vod_id":..., "vod_name":..., "vod_play_url":"第1集$https://...#第2集$https://..."}]}`)
- *    - 格式 C：标准 M3U / M3U8 直播/点播列表 (`#EXTINF:-1 tvg-logo="..." group-title="...",剧名 第01集`)
- * 2. 内置高可用精选剧库 (`builtInDetails`)，覆盖热门剧、漫剧、真人剧、AI 剧四大轨道，确保离线或上游维护时 100% 正常浏览与播放。
+ *    - 格式 B：苹果 CMS / MacCMS V10 VOD 接口 (`{"list":[{"vod_id":..., "vod_name":..., "vod_play_url":"第1集$https://...#第2集$https://..."}]}`)
+ *    - 格式 C：标准 M3U / M3U8 列表 (`#EXTINF:-1 tvg-logo="..." group-title="...",剧名 第01集`)
+ * 2. 支持远程 MacCMS V10 接口自动补全 `?ac=detail` 与在线搜索 (`?ac=detail&wd=...`)；
+ * 3. 已移除失效的境外测试假剧库，不再返回不可用死链，并支持按剧名自动匹配红果公开目录展示页。
  */
 class CustomSourceEngine(
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS)
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
         .build()
 ) : DramaProvider {
 
     override val sourceId: String = "custom"
-    override val sourceName: String = "聚聚自救源"
-    override val defaultBaseUrl: String = "local://built-in"
+    override val sourceName: String = "自定义片源"
+    override val defaultBaseUrl: String = "local://custom"
 
+    private val dynamicConfigs = ConcurrentHashMap<String, CustomSourceConfig>()
     private val dynamicDetails = ConcurrentHashMap<String, DramaDetail>()
-    private val builtInDetails: Map<String, DramaDetail> = createBuiltInCatalog()
 
     /**
      * 解析并挂载用户注入的自定义 JSON（聚聚格式或 MacCMS V10 格式）或 M3U 文本
@@ -50,8 +52,8 @@ class CustomSourceEngine(
         } else {
             parseJsonCatalog(sourceConfig, trimmed)
         }
-        // 清理该自定义源此前的旧剧目，防止更新或删除时残留
         removeCustomSource(sourceConfig.id)
+        dynamicConfigs[sourceConfig.id] = sourceConfig
         for (detail in parsed) {
             dynamicDetails[detail.id] = detail
         }
@@ -63,6 +65,7 @@ class CustomSourceEngine(
      */
     fun removeCustomSource(customSourceId: String): Int {
         if (customSourceId.isBlank()) return 0
+        dynamicConfigs.remove(customSourceId)
         var removed = 0
         val iterator = dynamicDetails.entries.iterator()
         while (iterator.hasNext()) {
@@ -79,30 +82,76 @@ class CustomSourceEngine(
         return removed
     }
 
-    fun hasDynamicSources(): Boolean = dynamicDetails.isNotEmpty()
+    fun hasDynamicSources(): Boolean = dynamicDetails.isNotEmpty() || dynamicConfigs.isNotEmpty()
 
     fun getDynamicCards(): List<DramaCard> = dynamicDetails.values.map { it.toCard() }
 
     /**
-     * 从远程 URL 拉取自定义源并挂载
+     * 按剧名在已挂载的自定义源中查找可播放剧集（用于红果公开目录与自有片源联动匹配）
+     */
+    fun findDynamicByTitle(title: String): DramaDetail? {
+        val normTarget = normalizeTitle(title)
+        if (normTarget.isBlank()) return null
+        val playable = dynamicDetails.values.filter { d -> d.episodes.any { it.streamUrl.isNotBlank() } }
+        playable.firstOrNull { normalizeTitle(it.title) == normTarget }?.let { return it }
+        if (normTarget.length >= 3) {
+            playable.firstOrNull { d ->
+                val normCand = normalizeTitle(d.title)
+                normCand.contains(normTarget) || normTarget.contains(normCand)
+            }?.let { return it }
+        }
+        return null
+    }
+
+    private fun normalizeTitle(raw: String): String =
+        raw.trim().lowercase().replace(Regex("[\\s:：·—\\-!！?？《》「」\"'.,，。]"), "")
+
+    private fun appendQuery(baseUrl: String, queryPart: String): String {
+        val sep = if (baseUrl.contains("?")) "&" else "?"
+        return "$baseUrl$sep$queryPart"
+    }
+
+    private fun fetchUrlBody(url: String): String? {
+        return try {
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; JMGO N1 Air) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36")
+                .build()
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                resp.body()?.string()
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * 从远程 URL 拉取自定义源并挂载（兼容 MacCMS V10 自动补全 `?ac=detail`）
      */
     fun refreshCustomSource(sourceConfig: CustomSourceConfig): List<DramaDetail> {
         if (!sourceConfig.enabled || sourceConfig.url.isBlank() || sourceConfig.url.startsWith("local://")) {
             return emptyList()
         }
-        return try {
-            val req = Request.Builder()
-                .url(sourceConfig.url)
-                .header("User-Agent", "JuJuTV/1.0 (Android 13; JMGO N1 Air)")
-                .build()
-            httpClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return emptyList()
-                val body = resp.body()?.string() ?: return emptyList()
-                loadFromRawContent(sourceConfig, body)
+        dynamicConfigs[sourceConfig.id] = sourceConfig
+
+        val cleanPath = sourceConfig.url.substringBefore("?").lowercase()
+        val isM3u = sourceConfig.type.equals("m3u", ignoreCase = true) ||
+            cleanPath.endsWith(".m3u") || cleanPath.endsWith(".m3u8")
+
+        if (!isM3u && !sourceConfig.url.contains("ac=", ignoreCase = true) && !cleanPath.endsWith(".json")) {
+            val cmsDetailUrl = appendQuery(sourceConfig.url, "ac=detail&pg=1")
+            val detailBody = fetchUrlBody(cmsDetailUrl)
+            if (!detailBody.isNullOrBlank()) {
+                val parsedDetail = loadFromRawContent(sourceConfig, detailBody)
+                if (parsedDetail.isNotEmpty() && parsedDetail.any { it.episodes.isNotEmpty() }) {
+                    return parsedDetail
+                }
             }
-        } catch (_: Throwable) {
-            emptyList()
         }
+
+        val body = fetchUrlBody(sourceConfig.url) ?: return emptyList()
+        return loadFromRawContent(sourceConfig, body)
     }
 
     fun parseJsonCatalog(sourceConfig: CustomSourceConfig, jsonText: String): List<DramaDetail> {
@@ -156,7 +205,7 @@ class CustomSourceEngine(
                             totalEpisodes = maxOf(episodes.size, obj.get("totalEpisodes")?.asInt ?: episodes.size),
                             isFinished = true,
                             score = score,
-                            playCountText = "自救源直连",
+                            playCountText = "自建源直连",
                             intro = intro,
                             episodes = episodes
                         )
@@ -171,7 +220,9 @@ class CustomSourceEngine(
                     val title = obj.get("vod_name")?.asString ?: continue
                     val cover = obj.get("vod_pic")?.asString ?: ""
                     val category = obj.get("type_name")?.asString ?: "真人剧"
-                    val intro = obj.get("vod_content")?.asString?.replace(Regex("<[^>]*>"), "") ?: ""
+                    val rawIntro = obj.get("vod_content")?.asString?.takeIf { it.isNotBlank() }
+                        ?: obj.get("vod_blurb")?.asString ?: ""
+                    val intro = rawIntro.replace(Regex("<[^>]*>"), "").trim()
                     val playUrlRaw = obj.get("vod_play_url")?.asString ?: ""
                     val episodes = parseMacCmsPlayUrl(id, playUrlRaw)
                     result.add(
@@ -185,9 +236,10 @@ class CustomSourceEngine(
                             tags = listOf(category, "CMS直连"),
                             totalEpisodes = maxOf(episodes.size, 1),
                             isFinished = true,
-                            score = obj.get("vod_score")?.asString ?: "9.4",
+                            score = obj.get("vod_score")?.asString?.takeIf { it.isNotBlank() && it != "0.0" } ?: "9.4",
                             playCountText = obj.get("vod_remarks")?.asString ?: "全集",
                             intro = intro,
+                            releaseYear = obj.get("vod_year")?.asString ?: "2026",
                             episodes = episodes
                         )
                     )
@@ -203,7 +255,8 @@ class CustomSourceEngine(
         if (vodPlayUrl.isBlank()) return emptyList()
         // 如果存在多组播放源（$$$ 分隔），优先选包含 .m3u8 或 .mp4 的一组
         val groups = vodPlayUrl.split("$$$")
-        val chosenGroup = groups.firstOrNull { it.contains(".m3u8") || it.contains(".mp4") } ?: groups.first()
+        val chosenGroup = groups.firstOrNull { it.contains(".m3u8", ignoreCase = true) || it.contains(".mp4", ignoreCase = true) }
+            ?: groups.first()
         val items = chosenGroup.split("#").filter { it.isNotBlank() }
         return items.mapIndexedNotNull { idx, raw ->
             val parts = raw.split("$", limit = 2)
@@ -213,7 +266,7 @@ class CustomSourceEngine(
             else EpisodeItem(
                 index = idx + 1,
                 episodeId = "${dramaId}_${idx + 1}",
-                title = epTitle,
+                title = epTitle.ifBlank { "第${idx + 1}集" },
                 streamUrl = url
             )
         }
@@ -236,7 +289,6 @@ class CustomSourceEngine(
                 pendingGroup = Regex("""group-title="([^"]+)"""").find(line)?.groupValues?.get(1) ?: "真人剧"
                 pendingTitle = line.substringAfterLast(",").trim()
             } else if (!line.startsWith("#") && pendingTitle.isNotEmpty()) {
-                // 拆解 "剧名 第01集" 或 "剧名#01"
                 val dramaName = pendingTitle.replace(Regex("""[\s#_-]*第?\d+[集话期].*$"""), "").trim().ifEmpty { pendingTitle }
                 val epLabel = pendingTitle.removePrefix(dramaName).trim().ifEmpty { "第1集" }
                 grouped.getOrPut(dramaName) { mutableListOf() }.add(epLabel to line)
@@ -264,7 +316,7 @@ class CustomSourceEngine(
                 sourceId = sourceConfig.id,
                 sourceName = sourceConfig.name,
                 category = categories[dramaTitle] ?: "真人剧",
-                tags = listOf(categories[dramaTitle] ?: "真人剧", "M3U自救源"),
+                tags = listOf(categories[dramaTitle] ?: "真人剧", "M3U直连"),
                 totalEpisodes = episodes.size,
                 isFinished = true,
                 score = "9.5",
@@ -275,12 +327,7 @@ class CustomSourceEngine(
         }
     }
 
-    private fun allDetails(): Collection<DramaDetail> {
-        val merged = LinkedHashMap<String, DramaDetail>()
-        merged.putAll(dynamicDetails)
-        merged.putAll(builtInDetails)
-        return merged.values
-    }
+    private fun allDetails(): Collection<DramaDetail> = dynamicDetails.values
 
     private fun DramaDetail.toCard(): DramaCard = DramaCard(
         id = id,
@@ -302,13 +349,17 @@ class CustomSourceEngine(
 
     override fun fetchHomeRails(baseUrlOverride: String?): List<RailFeed> {
         val allCards = allDetails().map { it.toCard() }
-        return listOf(
-            RailFeed("hot", "热门短剧", "全站高分必看热剧", allCards.take(8)),
-            RailFeed("category:漫剧", "高燃漫剧", "动态漫 · 热血玄幻", allCards.filter { it.category == "漫剧" }),
-            RailFeed("category:真人剧", "王牌真人剧", "都市逆袭 · 古装甜宠", allCards.filter { it.category == "真人剧" }),
-            RailFeed("category:AI 剧", "先锋 AI 剧", "AIGC 赛博奇幻剧场", allCards.filter { it.category == "AI 剧" }),
-            RailFeed("rest", "精选推荐", "编辑严选口碑佳作", allCards.reversed().take(8))
+        if (allCards.isEmpty()) return emptyList()
+        val rails = mutableListOf(
+            RailFeed("hot", "自定义直连片库", "已配置站源精选剧集", allCards.take(24))
         )
+        val comic = allCards.filter { it.category.contains("漫") }
+        if (comic.isNotEmpty()) rails.add(RailFeed("category:漫剧", "精品漫剧", "来自自定义片源", comic))
+        val human = allCards.filter { !it.category.contains("漫") && !it.category.contains("AI", ignoreCase = true) }
+        if (human.isNotEmpty()) rails.add(RailFeed("category:真人剧", "真人短剧", "来自自定义片源", human))
+        val ai = allCards.filter { it.category.contains("AI", ignoreCase = true) }
+        if (ai.isNotEmpty()) rails.add(RailFeed("category:AI 剧", "先锋 AI 剧", "来自自定义片源", ai))
+        return rails
     }
 
     override fun fetchCategories(baseUrlOverride: String?): List<CategoryNode> = listOf(
@@ -328,14 +379,15 @@ class CustomSourceEngine(
 
     override fun fetchCatalog(category: String, page: Int, baseUrlOverride: String?): List<DramaCard> {
         val allCards = allDetails().map { it.toCard() }
+        if (allCards.isEmpty()) return emptyList()
         if (category.isBlank() || category == "全部" || category == "all" || category == "hot") {
             return allCards
         }
         val clean = category.removePrefix("category:").trim()
         return allCards.filter { card ->
-            card.category.equals(clean, ignoreCase = true) ||
-                    card.tags.any { it.contains(clean, ignoreCase = true) }
-        }.ifEmpty { allCards }
+            card.category.contains(clean, ignoreCase = true) ||
+                card.tags.any { it.contains(clean, ignoreCase = true) }
+        }
     }
 
     override fun fetchRankings(subRank: String, page: Int, baseUrlOverride: String?): List<DramaCard> {
@@ -349,13 +401,13 @@ class CustomSourceEngine(
     }
 
     override fun fetchCalendar(dateStr: String, baseUrlOverride: String?): List<DramaCard> {
-        return allDetails().map { it.toCard() }.take(8)
+        return allDetails().map { it.toCard() }.take(12)
     }
 
     override fun browse(query: BrowseQuery, baseUrlOverride: String?): List<DramaCard> {
         var list = allDetails().map { it.toCard() }
         if (query.type != "全部" && query.type.isNotBlank()) {
-            list = list.filter { it.category.equals(query.type, ignoreCase = true) }
+            list = list.filter { it.category.contains(query.type, ignoreCase = true) }
         }
         if (query.genre != "全部" && query.genre.isNotBlank()) {
             list = list.filter { card -> card.tags.any { it.contains(query.genre, ignoreCase = true) } }
@@ -373,17 +425,36 @@ class CustomSourceEngine(
 
     override fun search(keyword: String, page: Int, baseUrlOverride: String?): List<DramaCard> {
         val kw = keyword.trim()
-        if (kw.isEmpty()) return allDetails().map { it.toCard() }.take(12)
-        return allDetails().filter { d ->
+        if (kw.isEmpty()) return allDetails().map { it.toCard() }.take(24)
+
+        val localHits = allDetails().filter { d ->
             d.title.contains(kw, ignoreCase = true) ||
-                    d.intro.contains(kw, ignoreCase = true) ||
-                    d.tags.any { it.contains(kw, ignoreCase = true) } ||
-                    d.creators.any { it.name.contains(kw, ignoreCase = true) }
+                d.intro.contains(kw, ignoreCase = true) ||
+                d.tags.any { it.contains(kw, ignoreCase = true) } ||
+                d.creators.any { it.name.contains(kw, ignoreCase = true) }
         }.map { it.toCard() }
+        if (localHits.isNotEmpty()) return localHits
+
+        // 对已挂载的远程苹果 CMS 接口自动发起实时 `?ac=detail&wd=` 检索
+        val remoteHits = mutableListOf<DramaCard>()
+        val encoded = URLEncoder.encode(kw, "UTF-8")
+        for (cfg in dynamicConfigs.values) {
+            if (!cfg.enabled || cfg.url.isBlank() || cfg.url.startsWith("local://")) continue
+            val cleanPath = cfg.url.substringBefore("?").lowercase()
+            if (cfg.type.equals("m3u", ignoreCase = true) || cleanPath.endsWith(".m3u") || cleanPath.endsWith(".m3u8")) continue
+            val searchUrl = appendQuery(cfg.url, "ac=detail&wd=$encoded&pg=$page")
+            val body = fetchUrlBody(searchUrl) ?: continue
+            val parsed = parseJsonCatalog(cfg, body)
+            for (d in parsed) {
+                dynamicDetails[d.id] = d
+                remoteHits.add(d.toCard())
+            }
+        }
+        return remoteHits
     }
 
     override fun fetchDetail(dramaId: String, baseUrlOverride: String?): DramaDetail? {
-        return dynamicDetails[dramaId] ?: builtInDetails[dramaId] ?: builtInDetails.values.firstOrNull()
+        return dynamicDetails[dramaId]
     }
 
     override fun resolveEpisodeStream(dramaId: String, episodeIndex: Int, baseUrlOverride: String?): EpisodeItem? {
@@ -392,103 +463,10 @@ class CustomSourceEngine(
     }
 
     override fun fetchComments(dramaId: String, episodeIndex: Int, baseUrlOverride: String?): List<CommentItem> {
-        val detail = fetchDetail(dramaId, baseUrlOverride)
-        val name = detail?.title ?: "本剧"
-        return listOf(
-            CommentItem(
-                id = "${dramaId}_c1",
-                userName = "坚果N1Air投影玩家",
-                content = "在坚果 N1 Air 2GB 上用聚聚看《$name》第${episodeIndex}集丝滑流畅，硬解直出完全不掉帧！",
-                likeCount = 328,
-                createdAt = "3分钟前",
-                episodeIndex = episodeIndex,
-                isLongReview = true
-            ),
-            CommentItem(
-                id = "${dramaId}_c2",
-                userName = "深夜追剧人",
-                content = "节奏太爽快了，反转一个接一个，下一集预加载切集完全零等待！",
-                likeCount = 196,
-                createdAt = "12分钟前",
-                episodeIndex = episodeIndex
-            ),
-            CommentItem(
-                id = "${dramaId}_c3",
-                userName = "大屏发烧友",
-                content = "手机扫码搜剧点播太方便了，不用拿遥控器按拼音了！",
-                likeCount = 89,
-                createdAt = "25分钟前",
-                episodeIndex = episodeIndex
-            )
-        )
+        return emptyList()
     }
 
     override fun fetchDanmaku(dramaId: String, episodeIndex: Int, baseUrlOverride: String?): List<DanmakuItem> {
-        val detail = fetchDetail(dramaId, baseUrlOverride)
-        val title = detail?.title ?: "短剧"
-        return listOf(
-            DanmakuItem("d1", 1000L, "前方高能预警！！《$title》第${episodeIndex}集打卡", 0xFF6B35, true),
-            DanmakuItem("d2", 2800L, "坚果 N1 Air 1080P 投墙画质绝了", 0x38BDF8),
-            DanmakuItem("d3", 4500L, "男主这波眼神杀直接封神", 0xFFFFFF),
-            DanmakuItem("d4", 6800L, "这反转我直接从沙发上蹦起来了", 0xFACC15),
-            DanmakuItem("d5", 9200L, "2GB 内存占用才 80MB，聚聚太稳了", 0x4ADE80),
-            DanmakuItem("d6", 12500L, "下一集已自动预加载就绪，冲冲冲！", 0xFFFFFF),
-            DanmakuItem("d7", 15800L, "全员演技在线，今年看过最爽的一部", 0xF472B6),
-            DanmakuItem("d8", 19500L, "名场面打卡留念！！！", 0x38BDF8)
-        )
-    }
-
-    private fun createBuiltInCatalog(): Map<String, DramaDetail> {
-        val specs = listOf(
-            Triple("hg_1001", "潜龙出渊：归来即巅峰", "真人剧") to listOf("逆袭", "战神", "都市"),
-            Triple("hg_1002", "盛世娇宠：王爷请接招", "真人剧") to listOf("古装", "甜宠", "重生"),
-            Triple("hg_1003", "重生1990：从摆摊到商业帝国", "真人剧") to listOf("年代", "逆袭", "都市"),
-            Triple("hg_1004", "星河武神：破苍穹", "漫剧") to listOf("仙侠", "脑洞", "逆袭"),
-            Triple("hg_1005", "天命剑仙：万年归来", "漫剧") to listOf("仙侠", "玄幻", "高燃"),
-            Triple("hg_1006", "末日机甲：觉醒序列001", "漫剧") to listOf("脑洞", "科幻", "悬疑"),
-            Triple("hg_1007", "赛博长安：机械霓裳", "AI 剧") to listOf("脑洞", "古装", "悬疑"),
-            Triple("hg_1008", "深空回响：山海经纪元", "AI 剧") to listOf("脑洞", "仙侠", "奇幻"),
-            Triple("hg_1009", "消失的第七夜：迷雾追踪", "真人剧") to listOf("悬疑", "都市", "家庭"),
-            Triple("hg_1010", "天才萌宝：总裁爹地宠上天", "真人剧") to listOf("萌宝", "甜宠", "都市"),
-            Triple("hg_1011", "北境战歌：护国龙帅", "真人剧") to listOf("战神", "逆袭", "家国"),
-            Triple("hg_1012", "九霄灵域：神凰涅槃", "AI 剧") to listOf("仙侠", "重生", "古装")
-        )
-
-        val map = LinkedHashMap<String, DramaDetail>()
-        specs.forEachIndexed { idx, (triple, tags) ->
-            val (id, title, cat) = triple
-            val totalEp = 60 + (idx * 5)
-            val episodes = (1..totalEp).map { epIdx ->
-                EpisodeItem(
-                    index = epIdx,
-                    episodeId = "${id}_ep_$epIdx",
-                    title = "第${epIdx}集",
-                    durationSec = 95 + (epIdx % 25),
-                    // 标准高兼容 H.264 MP4/HLS 流地址（可通过 LocalStreamGateway 代理与预加载）
-                    streamUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4"
-                )
-            }
-            map[id] = DramaDetail(
-                id = id,
-                title = title,
-                coverUrl = "https://picsum.photos/seed/$id/360/504",
-                sourceId = if (idx % 3 == 0) "hongguo" else if (idx % 3 == 1) "huangju" else "custom",
-                sourceName = if (idx % 3 == 0) "红果短剧" else if (idx % 3 == 1) "黄剧短剧" else "聚聚自救源",
-                category = cat,
-                tags = tags,
-                totalEpisodes = totalEp,
-                isFinished = idx % 4 != 3,
-                score = "9.${8 - (idx % 5)}",
-                playCountText = "${(950 - idx * 45)}万播放",
-                intro = "《$title》是一部精选${cat}佳作（${tags.joinToString(" · ")}）。专为坚果 N1 Air 1080P 大屏适配，支持硬件解码零拷贝直出、下一集无缝预加载与手机扫码选集。",
-                releaseYear = "2026",
-                creators = listOf(
-                    CreatorInfo("cr_${id}_1", "林星河", "领衔主演"),
-                    CreatorInfo("cr_${id}_2", "苏沐雪", "特邀主演")
-                ),
-                episodes = episodes
-            )
-        }
-        return map
+        return emptyList()
     }
 }
